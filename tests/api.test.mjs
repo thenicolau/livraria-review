@@ -1,0 +1,30 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { createApp } from '../server.mjs';
+
+test('API local: CRUD, persistência, download, importação e isolamento de origem',async t=>{
+ const temp=await mkdtemp(path.join(os.tmpdir(),'entrelinhas-api-'));const server=createApp({dataDirectory:path.join(temp,'reviews'),gitRoot:temp});
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(async()=>{await new Promise(resolve=>server.close(resolve));await rm(temp,{recursive:true,force:true});});
+ const base=`http://127.0.0.1:${server.address().port}`;const req=(route,options={})=>fetch(base+route,options);
+ assert.equal((await req('/')).status,200);assert.equal((await req('/../../package.json')).status,404);
+ assert.equal((await req('/api/session',{headers:{Origin:'https://untrusted.example'}})).status,403);
+ assert.equal((await req('/api/books',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).status,403);
+ const {token}=await(await req('/api/session')).json();const headers={'Content-Type':'application/json','X-Entrelinhas-Token':token};
+ const initial=await req('/api/books',{method:'POST',headers,body:JSON.stringify({title:'Memórias póstumas',authors:['Machado de Assis'],review:'Anotação com acentuação',status:'lendo',started:'2026-10'})});assert.equal(initial.status,201);const book=await initial.json();
+ const update=await req(`/api/books/${book.id}`,{method:'PUT',headers,body:JSON.stringify({...book,rating:'4,75',notes:'Uma nota'})});assert.equal(update.status,200);
+ const list=await(await req('/api/books')).json();assert.equal(list.books.length,1);assert.equal(list.books[0].rating,4.75);
+ const markdown=await(await req(`/api/books/${book.id}/markdown`)).text();assert.match(markdown,/Anotação com acentuação/);assert.match(markdown,/Uma nota/);
+ const invalid=await req(`/api/books/${book.id}`,{method:'PUT',headers,body:JSON.stringify({...book,rating:9})});assert.equal(invalid.status,400);assert.equal((await(await req('/api/books')).json()).books[0].rating,4.75);
+ const preview=await req('/api/kindle/preview',{method:'POST',headers,body:JSON.stringify({text:'Book (Author)\n- Your Highlight on Location 4 | Added today\n\nQuote\n=========='})});assert.equal((await preview.json()).entries.length,1);
+ const text='Memorias postumas (Assis, Machado de)\n- Sua nota na posição 10 | Adicionado hoje\n\nMinha nota Kindle\n==========';
+ const identified=await(await req('/api/kindle/preview',{method:'POST',headers,body:JSON.stringify({text})})).json();assert.equal(identified.groups[0].target,book.id);
+ const key=identified.groups[0].key;
+ assert.equal((await req('/api/kindle/import',{method:'POST',headers,body:JSON.stringify({text,choices:[{key,target:''}]})})).status,400);
+ const imported=await(await req('/api/kindle/import',{method:'POST',headers,body:JSON.stringify({text,choices:[{key,target:book.id}]})})).json();assert.equal(imported.added,1);
+ const afterImport=(await(await req('/api/books')).json()).books[0];assert.equal(afterImport.rating,4.75);assert.equal(afterImport.review,book.review);assert.equal(afterImport.notes,'Uma nota');assert.equal(afterImport.highlights[0].text,'Minha nota Kindle');
+ assert.equal((await req('/api/git/config',{method:'POST',headers,body:JSON.stringify({remote:'file:///unsafe'})})).status,400);
+ const remove=await req(`/api/books/${book.id}`,{method:'DELETE',headers});assert.equal(remove.status,200);assert.equal((await(await req('/api/books')).json()).books.length,0);
+});
